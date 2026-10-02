@@ -1,0 +1,5 @@
+# Daten werden von GitHub Actions täglich neu erzeugt
+data/
+_site/
+.claude/
+__pycache__/

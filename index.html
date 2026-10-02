@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temperaturrelief Deutschland</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/deck.gl@^9.0.0/dist.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #e6e9ef;
+    font: 14px/1.4 system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  .panel { position: absolute; left: 16px; right: 16px; bottom: 16px; max-width: 760px;
+    margin: 0 auto; background: rgba(20, 24, 31, .88); backdrop-filter: blur(6px);
+    border: 1px solid #2a313c; border-radius: 10px; padding: 12px 16px; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  #time { font-size: 18px; font-weight: 600; min-width: 210px; font-variant-numeric: tabular-nums; }
+  #slider { flex: 1; min-width: 200px; accent-color: #f28e2b; }
+  button { background: #f28e2b; color: #111; border: 0; border-radius: 6px;
+    padding: 6px 12px; font-weight: 600; cursor: pointer; min-width: 44px; }
+  label { font-size: 12px; color: #9aa4b2; display: flex; align-items: center; gap: 6px; }
+  label input[type=range] { width: 110px; }
+  #stats { font-size: 12px; color: #9aa4b2; margin-top: 6px; }
+  .legend { position: absolute; top: 16px; right: 16px; background: rgba(20, 24, 31, .88);
+    border: 1px solid #2a313c; border-radius: 10px; padding: 10px 12px; font-size: 12px; }
+  .legend canvas { display: block; width: 180px; height: 12px; border-radius: 3px; margin: 6px 0 2px; }
+  .legend .ticks { display: flex; justify-content: space-between; color: #9aa4b2; }
+  #loading { position: absolute; inset: 0; display: grid; place-items: center; font-size: 16px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="loading">Lade Daten …</div>
+
+<div class="legend">
+  <strong>Lufttemperatur 2 m</strong>
+  <canvas id="legend" width="180" height="12"></canvas>
+  <div class="ticks"><span id="lmin"></span><span id="lmid"></span><span id="lmax"></span></div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="play">▶</button>
+    <span id="time">–</span>
+    <input id="slider" type="range" min="0" max="0" step="any" value="0">
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>Überhöhung <input id="exag" type="range" min="0" max="20000" step="500" value="6000"></label>
+    <label>Max. Kantenlänge <input id="edge" type="range" min="40" max="300" step="10" value="120"><span id="edgeVal"></span></label>
+    <label>Tempo (h/s) <input id="speed" type="range" min="1" max="20" value="6"></label>
+    <label><input id="showEdges" type="checkbox" checked> Kanten</label>
+    <label><input id="showStems" type="checkbox"> Stäbe</label>
+  </div>
+  <div id="stats"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const DEG = Math.PI / 180;
+
+// ---------- Karte ----------
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+  center: [10.4, 51.0], zoom: 5.4, pitch: 55, bearing: -12, maxPitch: 85,
+  attributionControl: { customAttribution: 'Daten: Deutscher Wetterdienst' }
+});
+// Größe nachziehen, falls der Container beim Start noch keine Maße hatte
+new ResizeObserver(() => map.resize()).observe($('map'));
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-left');
+
+const overlay = new deck.MapboxOverlay({
+  interleaved: false,
+  getTooltip: ({ object }) => object && object.station && {
+    html: `<b>${object.station.name}</b><br>${object.t.toFixed(1)} °C<br>` +
+          `<span style="color:#9aa4b2">${object.station.state}, ${object.station.elev} m ü. NN</span>`
+  }
+});
+map.addControl(overlay);
+
+// ---------- Zustand ----------
+// tPos ist eine Kommazahl: 12.25 = Viertel zwischen Zeitschritt 12 und 13
+let DATA, color, tPos = 0, playing = false, lastNow = 0;
+const cache = new Map();   // Triangulation je Zeitschritt-Paar zwischenspeichern
+
+// Entfernung in km (equirektangulär genügt für Deutschland)
+function distKm(a, b) {
+  const x = (b.lon - a.lon) * Math.cos((a.lat + b.lat) / 2 * DEG);
+  const y = b.lat - a.lat;
+  return Math.sqrt(x * x + y * y) * 111.2;
+}
+
+// Delaunay-Triangulation aller Stationen, die in Zeitschritt i0 ODER i1 einen Wert haben.
+// So bleibt das Netz während des Übergangs von i0 nach i1 gleich und nur Höhen/Farben ändern sich.
+// Ergebnis enthält nur Stationsindizes – die Temperaturen kommen erst beim Zeichnen dazu.
+function triangulate(i0, i1, maxEdge) {
+  const key = i0 + '|' + maxEdge;
+  if (cache.has(key)) return cache.get(key);
+
+  const a = DATA.temps[i0], b = DATA.temps[i1];
+  const idx = [];
+  for (let j = 0; j < DATA.stations.length; j++) if (a[j] !== null || b[j] !== null) idx.push(j);
+
+  const S = DATA.stations;
+  const cosLat = Math.cos(51 * DEG);  // Längengrade stauchen -> annähernd winkeltreu
+  const del = d3.Delaunay.from(idx, j => S[j].lon * cosLat, j => S[j].lat);
+  const tris = [];
+  const T = del.triangles;
+  for (let k = 0; k < T.length; k += 3) {
+    const v = [idx[T[k]], idx[T[k + 1]], idx[T[k + 2]]];
+    // lange, dünne Dreiecke am Rand (z. B. über Nachbarländer/Meer) verwerfen
+    if (distKm(S[v[0]], S[v[1]]) > maxEdge ||
+        distKm(S[v[1]], S[v[2]]) > maxEdge ||
+        distKm(S[v[2]], S[v[0]]) > maxEdge) continue;
+    tris.push(v);
+  }
+  const result = { idx, tris };
+  cache.set(key, result);
+  return result;
+}
+
+// Temperaturen zum Zeitpunkt tPos: linear zwischen den beiden Nachbar-Stunden.
+// Fehlt ein Wert auf einer Seite, wird der andere verwendet.
+function sample() {
+  const n = DATA.times.length;
+  const i0 = Math.min(Math.floor(tPos), n - 1), i1 = Math.min(i0 + 1, n - 1);
+  const f = tPos - i0;
+  const a = DATA.temps[i0], b = DATA.temps[i1];
+  const temps = a.map((va, j) => {
+    const vb = b[j];
+    if (va === null) return vb;
+    if (vb === null) return va;
+    return va + (vb - va) * f;
+  });
+  return { i0, i1, f, temps };
+}
+
+const rgb = t => { const c = d3.rgb(color(t)); return [c.r, c.g, c.b]; };
+
+function render() {
+  const exag = +$('exag').value;              // Meter pro °C
+  const maxEdge = +$('edge').value;
+  const { i0, i1, f, temps } = sample();
+  const { idx, tris: triIdx } = triangulate(i0, i1, maxEdge);
+
+  const z = t => (t - DATA.min) * exag;       // kälteste Temperatur = Boden
+  const pts = idx.map(j => ({ station: DATA.stations[j], t: temps[j] }));
+  const byStation = new Map(idx.map((j, k) => [j, pts[k]]));
+  const tris = triIdx.map(v => {
+    const p = v.map(j => byStation.get(j));
+    return { v: p, mean: (p[0].t + p[1].t + p[2].t) / 3 };
+  });
+  for (const p of pts) p.pos = [p.station.lon, p.station.lat, z(p.t)];
+  const pos = p => p.pos;
+
+  const layers = [
+    new deck.SolidPolygonLayer({
+      id: 'surface', data: tris,
+      _full3d: true, extruded: false,
+      getPolygon: d => d.v.map(pos),
+      getFillColor: d => [...rgb(d.mean), 215]
+    }),
+    $('showEdges').checked && new deck.LineLayer({
+      id: 'edges', data: tris.flatMap(d => [[d.v[0], d.v[1]], [d.v[1], d.v[2]], [d.v[2], d.v[0]]]),
+      getSourcePosition: e => pos(e[0]), getTargetPosition: e => pos(e[1]),
+      getColor: [255, 255, 255, 45], getWidth: 1
+    }),
+    $('showStems').checked && new deck.LineLayer({
+      id: 'stems', data: pts,
+      getSourcePosition: p => [p.station.lon, p.station.lat, 0], getTargetPosition: pos,
+      getColor: [180, 190, 205, 70], getWidth: 1
+    }),
+    new deck.ScatterplotLayer({
+      id: 'stations', data: pts, pickable: true,
+      getPosition: pos, getFillColor: p => rgb(p.t),
+      getLineColor: [15, 17, 22], lineWidthMinPixels: 1, stroked: true,
+      radiusUnits: 'pixels', getRadius: 3.5
+    })
+  ].filter(Boolean);
+  overlay.setProps({ layers });
+
+  // Beschriftung + Kennzahlen (Zeit ebenfalls interpoliert, auf Minuten)
+  const ms = Date.parse(DATA.times[i0]) + f * (Date.parse(DATA.times[i1]) - Date.parse(DATA.times[i0]));
+  const d = new Date(Math.round(ms / 60000) * 60000);
+  $('time').textContent = d.toLocaleString('de-DE', { timeZone: 'Europe/Berlin',
+    weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const mean = d3.mean(pts, p => p.t);
+  const hot = d3.greatest(pts, p => p.t), cold = d3.least(pts, p => p.t);
+  $('stats').textContent = `${pts.length} Stationen · ${tris.length} Dreiecke · Ø ${mean.toFixed(1)} °C · ` +
+    `wärmste: ${hot.station.name} ${hot.t.toFixed(1)} °C · kälteste: ${cold.station.name} ${cold.t.toFixed(1)} °C`;
+  $('edgeVal').textContent = maxEdge + ' km';
+}
+
+function drawLegend() {
+  const cv = $('legend'), ctx = cv.getContext('2d');
+  for (let x = 0; x < cv.width; x++) {
+    ctx.fillStyle = color(DATA.min + (DATA.max - DATA.min) * x / (cv.width - 1));
+    ctx.fillRect(x, 0, 1, cv.height);
+  }
+  $('lmin').textContent = DATA.min.toFixed(0) + ' °C';
+  $('lmid').textContent = ((DATA.min + DATA.max) / 2).toFixed(0) + ' °C';
+  $('lmax').textContent = DATA.max.toFixed(0) + ' °C';
+}
+
+// ---------- Animation ----------
+// Jeder Bildschirm-Frame rückt tPos um (vergangene Zeit × Tempo) vor -> fließende Bewegung
+function tick(now) {
+  if (!playing) return;
+  const dt = lastNow ? (now - lastNow) / 1000 : 0;   // Sekunden seit letztem Frame
+  lastNow = now;
+  const hoursPerSecond = +$('speed').value;
+  const last = DATA.times.length - 1;
+  tPos += dt * hoursPerSecond;
+  if (tPos > last) tPos = 0;                          // am Ende von vorn beginnen
+  $('slider').value = tPos;
+  render();
+  requestAnimationFrame(tick);
+}
+
+$('play').onclick = () => {
+  playing = !playing;
+  $('play').textContent = playing ? '❚❚' : '▶';
+  lastNow = 0;
+  if (playing) requestAnimationFrame(tick);
+};
+$('slider').oninput = e => { tPos = +e.target.value; render(); };
+for (const id of ['exag', 'edge', 'showEdges', 'showStems']) $(id).oninput = render;
+
+// ---------- Daten laden ----------
+fetch('data/temperatures.json')
+  .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+  .then(json => {
+    DATA = json;
+    // blau = kalt, rot = warm, Skala über den gesamten Zeitraum fixiert
+    color = d3.scaleSequential(d3.interpolateRdYlBu).domain([DATA.max, DATA.min]);
+    $('slider').max = DATA.times.length - 1;
+    tPos = DATA.times.length - 1;
+    $('slider').value = tPos;
+    drawLegend();
+    $('loading').remove();
+    render();
+  })
+  .catch(err => {
+    $('loading').textContent = 'Konnte data/temperatures.json nicht laden – läuft ein lokaler Server ' +
+      '(python3 -m http.server) und wurde fetch_dwd.py ausgeführt? (' + err.message + ')';
+  });
+</script>
+</body>
+</html>
