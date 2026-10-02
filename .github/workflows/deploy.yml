@@ -28,7 +28,7 @@ jobs:
           python-version: "3.12"
 
       - name: DWD-Daten laden
-        run: python fetch_dwd.py --days 7
+        run: python fetch_dwd.py --days 365
 
       - name: Website zusammenstellen
         run: |

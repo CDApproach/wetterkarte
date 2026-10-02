@@ -49,7 +49,7 @@
   <div class="row" style="margin-top:8px">
     <label>Überhöhung <input id="exag" type="range" min="0" max="20000" step="500" value="6000"></label>
     <label>Max. Kantenlänge <input id="edge" type="range" min="40" max="300" step="10" value="120"><span id="edgeVal"></span></label>
-    <label>Tempo (h/s) <input id="speed" type="range" min="1" max="20" value="6"></label>
+    <label>Tempo (h/s) <input id="speed" type="range" min="1" max="240" value="24"></label>
     <label><input id="showEdges" type="checkbox" checked> Kanten</label>
     <label><input id="showStems" type="checkbox"> Stäbe</label>
   </div>
@@ -117,6 +117,7 @@ function triangulate(i0, i1, maxEdge) {
     tris.push(v);
   }
   const result = { idx, tris };
+  if (cache.size > 500) cache.clear();   // bei einem Jahr Daten den Speicher begrenzen
   cache.set(key, result);
   return result;
 }

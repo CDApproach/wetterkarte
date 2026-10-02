@@ -6,7 +6,7 @@ Die Stationen bilden ein Dreiecksnetz; Höhe und Farbe entsprechen der Temperatu
 ## Lokal starten
 
 ```bash
-python3 fetch_dwd.py --days 7
+python3 fetch_dwd.py --days 365
 python3 -m http.server 8765
 ```
 
