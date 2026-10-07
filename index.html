@@ -228,7 +228,10 @@ function render() {
 
   const layers = [
     new deck.SolidPolygonLayer({
-      id: 'surface', data: tris,
+      // Die Fläche wird bei jedem neuen Dreiecksnetz (andere Messgröße, Stunde oder Kantenlänge)
+      // neu angelegt. Grund: deck.gl aktualisiert sonst beim Schrumpfen des Netzes die
+      // Dreiecksindizes nicht vollständig, und alte Dreiecke bleiben sichtbar.
+      id: `surface-${DATA.param}-${i0}-${maxEdge}`, data: tris,
       _full3d: true, extruded: false,
       getPolygon: d => d.v.map(pos),
       getFillColor: d => [...rgb(d.mean), 215]
