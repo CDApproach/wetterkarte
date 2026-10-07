@@ -1,8 +1,13 @@
 """
-Lädt stündliche Lufttemperaturen aller DWD-Stationen (Open Data, "recent")
-und schreibt sie kompakt nach data/temperatures.json für die Webkarte.
+Lädt stündliche Messwerte aller DWD-Stationen (Open Data, "recent")
+und schreibt sie kompakt nach data/<messgröße>.json für die Webkarte.
 
-Aufruf:  python3 fetch_dwd.py --days 7
+Messgrößen:
+  temperature    Lufttemperatur 2 m in °C
+  precipitation  Niederschlagshöhe in mm pro Stunde
+
+Aufruf:  python3 fetch_dwd.py --days 365                  (beide Messgrößen)
+         python3 fetch_dwd.py --days 7 --param temperature
 Nur Standardbibliothek nötig.
 """
 import argparse
@@ -15,10 +20,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-BASE = ("https://opendata.dwd.de/climate_environment/CDC/"
-        "observations_germany/climate/hourly/air_temperature/recent/")
-STATION_LIST = "TU_Stundenwerte_Beschreibung_Stationen.txt"
-OUT = Path(__file__).parent / "data" / "temperatures.json"
+ROOT = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/hourly/"
+
+# Je Messgröße: DWD-Verzeichnis, Kürzel im Dateinamen, Spalte des Messwerts
+PARAMS = {
+    "temperature":   {"dir": "air_temperature", "code": "TU", "column": 3, "unit": "°C"},
+    "precipitation": {"dir": "precipitation",   "code": "RR", "column": 3, "unit": "mm/h"},
+}
+OUT_DIR = Path(__file__).parent / "data"
 
 
 def get(url):
@@ -26,15 +35,15 @@ def get(url):
         return r.read()
 
 
-def load_stations():
+def load_stations(base, code):
     """Stationsliste parsen: id, Höhe, Lat, Lon, Name, Bundesland."""
-    text = get(BASE + STATION_LIST).decode("latin-1")
+    text = get(f"{base}{code}_Stundenwerte_Beschreibung_Stationen.txt").decode("latin-1")
     stations = {}
     for line in text.splitlines()[2:]:
         parts = line.split()
         if len(parts) < 9:
             continue
-        sid, _von, bis, elev, lat, lon = parts[:6]
+        sid, _von, _bis, elev, lat, lon = parts[:6]
         stations[sid] = {
             "id": sid,
             "name": " ".join(parts[6:-2]),
@@ -42,20 +51,19 @@ def load_stations():
             "elev": float(elev),
             "lat": float(lat),
             "lon": float(lon),
-            "bis": bis,
         }
     return stations
 
 
-def list_zip_files():
-    html = get(BASE).decode("latin-1")
-    return sorted(set(re.findall(r"stundenwerte_TU_(\d{5})_akt\.zip", html)))
+def list_zip_files(base, code):
+    html = get(base).decode("latin-1")
+    return sorted(set(re.findall(rf"stundenwerte_{code}_(\d{{5}})_akt\.zip", html)))
 
 
-def load_station_data(sid, cutoff):
-    """Gibt {zeitstempel 'YYYYMMDDHH': temperatur} für eine Station zurück."""
+def load_station_data(base, code, column, sid, cutoff):
+    """Gibt {zeitstempel 'YYYYMMDDHH': messwert} für eine Station zurück."""
     try:
-        raw = get(f"{BASE}stundenwerte_TU_{sid}_akt.zip")
+        raw = get(f"{base}stundenwerte_{code}_{sid}_akt.zip")
     except Exception as e:  # Station kurzzeitig nicht erreichbar -> überspringen
         print(f"  {sid}: Download fehlgeschlagen ({e})")
         return sid, {}
@@ -65,75 +73,85 @@ def load_station_data(sid, cutoff):
     values = {}
     for line in text.splitlines()[1:]:
         cols = [c.strip() for c in line.split(";")]
-        if len(cols) < 4 or cols[1] < cutoff:
+        if len(cols) <= column or cols[1] < cutoff:
             continue
-        t = float(cols[3])
-        if t > -999:  # -999 = Fehlwert
-            values[cols[1]] = round(t, 1)
+        v = float(cols[column])
+        if v > -999:  # -999 = Fehlwert
+            values[cols[1]] = v
     return sid, values
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=int, default=7, help="Zeitraum in Tagen (Standard 7)")
-    ap.add_argument("--min-coverage", type=float, default=0.5,
-                    help="Mindestanteil vorhandener Werte je Station (0..1)")
-    args = ap.parse_args()
-
-    print("Lade Stationsliste ...")
-    stations = load_stations()
-    ids = [s for s in list_zip_files() if s in stations]
-    print(f"{len(ids)} Stationen mit aktuellen Daten")
+def fetch(param, days, min_coverage):
+    cfg = PARAMS[param]
+    base = f"{ROOT}{cfg['dir']}/recent/"
+    print(f"[{param}] Lade Stationsliste ...")
+    stations = load_stations(base, cfg["code"])
+    ids = [s for s in list_zip_files(base, cfg["code"]) if s in stations]
+    print(f"[{param}] {len(ids)} Stationen mit aktuellen Daten")
 
     # Der "recent"-Datensatz endet meist gestern 23 UTC; Zeitraum ab dort rückwärts
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    cutoff_dt = now - timedelta(days=args.days + 2)
-    cutoff = cutoff_dt.strftime("%Y%m%d%H")
+    cutoff = (now - timedelta(days=days + 2)).strftime("%Y%m%d%H")
 
-    print("Lade Messwerte (parallel) ...")
     data = {}
+    load = lambda s: load_station_data(base, cfg["code"], cfg["column"], s, cutoff)
     with ThreadPoolExecutor(max_workers=16) as pool:
-        for i, (sid, vals) in enumerate(pool.map(lambda s: load_station_data(s, cutoff), ids), 1):
+        for i, (sid, vals) in enumerate(pool.map(load, ids), 1):
             if vals:
                 data[sid] = vals
-            if i % 50 == 0:
+            if i % 200 == 0:
                 print(f"  {i}/{len(ids)}")
 
     # Gemeinsame Zeitachse: die letzten N Tage bis zum letzten vorhandenen Zeitstempel
     last = max(max(v) for v in data.values())
     end = datetime.strptime(last, "%Y%m%d%H").replace(tzinfo=timezone.utc)
-    start = end - timedelta(days=args.days) + timedelta(hours=1)
-    times = []
-    t = start
-    while t <= end:
-        times.append(t)
-        t += timedelta(hours=1)
-    keys = [t.strftime("%Y%m%d%H") for t in times]
+    hours = days * 24
+    start = end - timedelta(hours=hours - 1)
+    keys = [(start + timedelta(hours=h)).strftime("%Y%m%d%H") for h in range(hours)]
 
     out_stations, columns = [], []
     for sid in sorted(data):
-        col = [data[sid].get(k) for k in keys]
-        coverage = sum(v is not None for v in col) / len(col)
-        if coverage < args.min_coverage:
+        # Werte als ganze Zehntel speichern (15.3 °C -> 153): kleinere Datei, schneller im Browser
+        col = [round(data[sid][k] * 10) if k in data[sid] else None for k in keys]
+        if sum(v is not None for v in col) / hours < min_coverage:
             continue
         s = stations[sid]
-        out_stations.append({k: s[k] for k in ("id", "name", "state", "elev", "lat", "lon")})
+        out_stations.append(s)
         columns.append(col)
 
-    # temps[zeitindex][stationsindex]
-    temps = [list(row) for row in zip(*columns)]
-    flat = [v for row in temps for v in row if v is not None]
+    values = [list(row) for row in zip(*columns)]   # values[stunde][station]
+    flat = sorted(v for row in values for v in row if v is not None)
+    nonzero = [v for v in flat if v > 0]
+    p99 = nonzero[int(len(nonzero) * 0.99)] if nonzero else flat[-1]
 
-    OUT.parent.mkdir(exist_ok=True)
-    OUT.write_text(json.dumps({
+    out = OUT_DIR / f"{param}.json"
+    out.write_text(json.dumps({
+        "param": param,
+        "unit": cfg["unit"],
         "source": "Deutscher Wetterdienst (DWD), opendata.dwd.de",
-        "times": [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in times],
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),   # stündliche Werte ab hier
+        "hours": hours,
+        "divisor": 10,                                    # gespeicherte Werte / 10 = echte Werte
         "stations": out_stations,
-        "temps": temps,
-        "min": min(flat),
-        "max": max(flat),
+        "values": values,
+        "min": flat[0] / 10,
+        "max": flat[-1] / 10,
+        "p99": p99 / 10,                                  # 99 % aller Werte > 0 liegen darunter
     }, separators=(",", ":")), encoding="utf-8")
-    print(f"Fertig: {len(out_stations)} Stationen x {len(times)} Stunden -> {OUT}")
+    print(f"[{param}] Fertig: {len(out_stations)} Stationen x {hours} Stunden -> {out}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=365, help="Zeitraum in Tagen (Standard 365)")
+    ap.add_argument("--param", choices=[*PARAMS, "all"], default="all", help="Messgröße (Standard: alle)")
+    ap.add_argument("--min-coverage", type=float, default=0.5,
+                    help="Mindestanteil vorhandener Werte je Station (0..1)")
+    args = ap.parse_args()
+
+    OUT_DIR.mkdir(exist_ok=True)
+    for param in (PARAMS if args.param == "all" else [args.param]):
+        fetch(param, args.days, args.min_coverage)
 
 
 if __name__ == "__main__":

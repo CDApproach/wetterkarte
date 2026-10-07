@@ -1,12 +1,13 @@
 # Wetterkarte
 
-2,5D-Temperaturkarte Deutschlands aus den stündlichen Messwerten aller DWD-Stationen.
-Die Stationen bilden ein Dreiecksnetz; Höhe und Farbe entsprechen der Temperatur.
+2,5D-Wetterkarte Deutschlands aus den stündlichen Messwerten aller DWD-Stationen,
+umschaltbar zwischen Temperatur und Niederschlag.
+Die Stationen bilden ein Dreiecksnetz; Höhe und Farbe entsprechen dem Messwert.
 
 ## Lokal starten
 
 ```bash
-python3 fetch_dwd.py --days 365
+python3 fetch_dwd.py --days 365          # lädt Temperatur und Niederschlag
 python3 -m http.server 8765
 ```
 

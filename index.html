@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Temperaturrelief Deutschland</title>
+<title>Wetterrelief Deutschland</title>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-<script src="https://unpkg.com/deck.gl@^9.0.0/dist.min.js"></script>
+<script src="https://unpkg.com/deck.gl@9.4.0/dist.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
   html, body { margin: 0; height: 100%; background: #0e1116; color: #e6e9ef;
     font: 14px/1.4 system-ui, sans-serif; }
-  #map { position: absolute; inset: 0; }
+  #map { position: absolute; inset: 0; z-index: 0; }
+  .panel, .legend, #loading { z-index: 2; }
   .panel { position: absolute; left: 16px; right: 16px; bottom: 16px; max-width: 760px;
     margin: 0 auto; background: rgba(20, 24, 31, .88); backdrop-filter: blur(6px);
     border: 1px solid #2a313c; border-radius: 10px; padding: 12px 16px; }
@@ -20,6 +21,10 @@
   #slider { flex: 1; min-width: 200px; accent-color: #f28e2b; }
   button { background: #f28e2b; color: #111; border: 0; border-radius: 6px;
     padding: 6px 12px; font-weight: 600; cursor: pointer; min-width: 44px; }
+  .switch { display: inline-flex; border: 1px solid #2a313c; border-radius: 7px; overflow: hidden; }
+  .switch button { background: transparent; color: #9aa4b2; border-radius: 0; font-weight: 500; }
+  .switch button[aria-pressed=true] { background: #2a313c; color: #e6e9ef; font-weight: 600; }
+  .switch button:disabled { cursor: wait; }
   label { font-size: 12px; color: #9aa4b2; display: flex; align-items: center; gap: 6px; }
   label input[type=range] { width: 110px; }
   #stats { font-size: 12px; color: #9aa4b2; margin-top: 6px; }
@@ -27,7 +32,10 @@
     border: 1px solid #2a313c; border-radius: 10px; padding: 10px 12px; font-size: 12px; }
   .legend canvas { display: block; width: 180px; height: 12px; border-radius: 3px; margin: 6px 0 2px; }
   .legend .ticks { display: flex; justify-content: space-between; color: #9aa4b2; }
-  #loading { position: absolute; inset: 0; display: grid; place-items: center; font-size: 16px; }
+  .legend .note { color: #9aa4b2; margin-top: 4px; max-width: 180px; }
+  #loading { position: absolute; inset: 0; display: grid; place-items: center; font-size: 16px;
+    background: rgba(14, 17, 22, .6); pointer-events: none; }
+  #loading[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -35,19 +43,26 @@
 <div id="loading">Lade Daten …</div>
 
 <div class="legend">
-  <strong>Lufttemperatur 2 m</strong>
+  <strong id="legendTitle"></strong>
   <canvas id="legend" width="180" height="12"></canvas>
   <div class="ticks"><span id="lmin"></span><span id="lmid"></span><span id="lmax"></span></div>
+  <div class="note" id="legendNote"></div>
 </div>
 
 <div class="panel">
   <div class="row">
+    <div class="switch" role="group" aria-label="Messgröße">
+      <button data-var="temperature" aria-pressed="true">Temperatur</button>
+      <button data-var="precipitation" aria-pressed="false">Niederschlag</button>
+    </div>
+  </div>
+  <div class="row" style="margin-top:8px">
     <button id="play">▶</button>
     <span id="time">–</span>
     <input id="slider" type="range" min="0" max="0" step="any" value="0">
   </div>
   <div class="row" style="margin-top:8px">
-    <label>Überhöhung <input id="exag" type="range" min="0" max="20000" step="500" value="6000"></label>
+    <label>Überhöhung <input id="exag" type="range"></label>
     <label>Max. Kantenlänge <input id="edge" type="range" min="40" max="300" step="10" value="120"><span id="edgeVal"></span></label>
     <label>Tempo (h/s) <input id="speed" type="range" min="1" max="240" value="24"></label>
     <label><input id="showEdges" type="checkbox" checked> Kanten</label>
@@ -59,6 +74,50 @@
 <script>
 const $ = id => document.getElementById(id);
 const DEG = Math.PI / 180;
+const HOUR = 3600 * 1000;
+const BALL_RADIUS_PX = 2.5;   // Kugelradius in Bildschirmpixeln
+
+// ---------- Messgrößen ----------
+// Je Messgröße: Datei, Beschriftung, Farbskala, Höhenberechnung und Kennzahlen.
+const VARS = {
+  temperature: {
+    file: 'data/temperature.json', title: 'Lufttemperatur 2 m', unit: '°C',
+    exag: { min: 0, max: 20000, step: 500, value: 3000 },   // Meter pro °C
+    // blau = kalt, rot = warm; Skala über den gesamten Zeitraum fixiert
+    makeColor: d => d3.scaleSequential(d3.interpolateRdYlBu).domain([d.max, d.min]),
+    height: (v, d) => v - d.min,                              // kälteste Temperatur = Boden
+    valueAt: (x, d) => d.min + x * (d.max - d.min),           // Legende: Position 0..1 -> Wert
+    legend: d => ({ ticks: [d.min, (d.min + d.max) / 2, d.max].map(v => v.toFixed(0) + ' °C'), note: '' }),
+    stats: (pts) => {
+      const hot = d3.greatest(pts, p => p.v), cold = d3.least(pts, p => p.v);
+      return `${pts.length} Stationen · Ø ${d3.mean(pts, p => p.v).toFixed(1)} °C · ` +
+        `wärmste: ${hot.station.name} ${hot.v.toFixed(1)} °C · kälteste: ${cold.station.name} ${cold.v.toFixed(1)} °C`;
+    }
+  },
+  precipitation: {
+    file: 'data/precipitation.json', title: 'Niederschlag', unit: 'mm/h',
+    exag: { min: 0, max: 150000, step: 5000, value: 40000 },  // Meter pro √(mm/h)
+    // braun = trocken, blau = nass. Wurzel-Skala, damit auch Nieselregen sichtbar ist;
+    // Obergrenze = 99 % aller Regenstunden, Starkregen darüber bekommt die dunkelste Farbe.
+    makeColor: d => d3.scaleSequentialSqrt(d3.interpolateRgbBasis(
+        ['#8c510a', '#d8b365', '#f6e8c3', '#c6dbef', '#6baed6', '#2171b5', '#08306b']))
+      .domain([0, Math.ceil(d.p99)]).clamp(true),
+    height: v => Math.sqrt(v),       // Wurzel: Starkregen überragt nicht alles andere
+    valueAt: (x, d) => x * x * Math.ceil(d.p99),
+    legend: d => {
+      const top = Math.ceil(d.p99);
+      return { ticks: ['0', fmt(top / 4), '≥ ' + top].map(s => s + ' mm/h'),
+               note: 'Höhe und Farbe wachsen mit der Wurzel der Regenmenge.' };
+    },
+    stats: (pts) => {
+      const wet = pts.filter(p => p.v >= 0.1);
+      const top = d3.greatest(pts, p => p.v);
+      return `${pts.length} Stationen · ${wet.length} mit Niederschlag · Ø ${d3.mean(pts, p => p.v).toFixed(2)} mm/h` +
+        (top.v >= 0.1 ? ` · am nassesten: ${top.station.name} ${top.v.toFixed(1)} mm/h` : '');
+    }
+  }
+};
+const fmt = v => (Math.round(v * 10) / 10).toLocaleString('de-DE');
 
 // ---------- Karte ----------
 const map = new maplibregl.Map({
@@ -74,16 +133,27 @@ map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-
 const overlay = new deck.MapboxOverlay({
   interleaved: false,
   getTooltip: ({ object }) => object && object.station && {
-    html: `<b>${object.station.name}</b><br>${object.t.toFixed(1)} °C<br>` +
+    html: `<b>${object.station.name}</b><br>${object.v.toFixed(1)} ${VAR.unit}<br>` +
           `<span style="color:#9aa4b2">${object.station.state}, ${object.station.elev} m ü. NN</span>`
   }
 });
 map.addControl(overlay);
 
+// Kugel-Modell mit Radius 1; die echte Größe kommt über sizeScale
+const SPHERE = new luma.SphereGeometry({ radius: 1, nlat: 12, nlong: 18 });
+
+// Kugeln sollen auf dem Bildschirm immer gleich groß wirken -> Meter pro Pixel beim aktuellen Zoom
+function metersPerPixel() {
+  return 40075016.686 * Math.cos(map.getCenter().lat * DEG) / (512 * 2 ** map.getZoom());
+}
+
 // ---------- Zustand ----------
-// tPos ist eine Kommazahl: 12.25 = Viertel zwischen Zeitschritt 12 und 13
-let DATA, color, tPos = 0, playing = false, lastNow = 0;
-const cache = new Map();   // Triangulation je Zeitschritt-Paar zwischenspeichern
+let VAR, DATA, color;            // aktive Messgröße, ihre Daten und Farbskala
+let tPos = 0;                    // Kommazahl: 12.25 = Viertel zwischen Stunde 12 und 13
+let playing = false, lastNow = 0;
+const loaded = {};               // bereits geladene Datensätze je Messgröße
+const exagValue = {};            // Überhöhung je Messgröße merken
+const cache = new Map();         // Triangulation je Zeitschritt-Paar zwischenspeichern
 
 // Entfernung in km (equirektangulär genügt für Deutschland)
 function distKm(a, b) {
@@ -92,16 +162,15 @@ function distKm(a, b) {
   return Math.sqrt(x * x + y * y) * 111.2;
 }
 
-// Delaunay-Triangulation aller Stationen, die in Zeitschritt i0 ODER i1 einen Wert haben.
+// Delaunay-Triangulation aller Stationen, die in Stunde i0 ODER i1 einen Wert haben.
 // So bleibt das Netz während des Übergangs von i0 nach i1 gleich und nur Höhen/Farben ändern sich.
-// Ergebnis enthält nur Stationsindizes – die Temperaturen kommen erst beim Zeichnen dazu.
 function triangulate(i0, i1, maxEdge) {
-  const key = i0 + '|' + maxEdge;
+  const key = DATA.param + '|' + i0 + '|' + maxEdge;
   if (cache.has(key)) return cache.get(key);
 
-  const a = DATA.temps[i0], b = DATA.temps[i1];
+  const a = DATA.rows[i0], b = DATA.rows[i1];
   const idx = [];
-  for (let j = 0; j < DATA.stations.length; j++) if (a[j] !== null || b[j] !== null) idx.push(j);
+  for (let j = 0; j < DATA.stations.length; j++) if (a[j] !== MISSING || b[j] !== MISSING) idx.push(j);
 
   const S = DATA.stations;
   const cosLat = Math.cos(51 * DEG);  // Längengrade stauchen -> annähernd winkeltreu
@@ -122,38 +191,39 @@ function triangulate(i0, i1, maxEdge) {
   return result;
 }
 
-// Temperaturen zum Zeitpunkt tPos: linear zwischen den beiden Nachbar-Stunden.
+// Werte zum Zeitpunkt tPos: linear zwischen den beiden Nachbar-Stunden.
 // Fehlt ein Wert auf einer Seite, wird der andere verwendet.
 function sample() {
-  const n = DATA.times.length;
+  const n = DATA.hours;
   const i0 = Math.min(Math.floor(tPos), n - 1), i1 = Math.min(i0 + 1, n - 1);
   const f = tPos - i0;
-  const a = DATA.temps[i0], b = DATA.temps[i1];
-  const temps = a.map((va, j) => {
-    const vb = b[j];
-    if (va === null) return vb;
-    if (vb === null) return va;
-    return va + (vb - va) * f;
-  });
-  return { i0, i1, f, temps };
+  const a = DATA.rows[i0], b = DATA.rows[i1], div = DATA.divisor;
+  const values = new Float32Array(a.length);
+  for (let j = 0; j < a.length; j++) {
+    const va = a[j], vb = b[j];
+    values[j] = va === MISSING ? vb / div : vb === MISSING ? va / div : (va + (vb - va) * f) / div;
+  }
+  return { i0, i1, f, values };
 }
 
-const rgb = t => { const c = d3.rgb(color(t)); return [c.r, c.g, c.b]; };
+const rgb = v => { const c = d3.rgb(color(v)); return [c.r, c.g, c.b]; };
 
 function render() {
-  const exag = +$('exag').value;              // Meter pro °C
+  if (!DATA) return;
+  const exag = +$('exag').value;
   const maxEdge = +$('edge').value;
-  const { i0, i1, f, temps } = sample();
+  const { i0, i1, f, values } = sample();
   const { idx, tris: triIdx } = triangulate(i0, i1, maxEdge);
 
-  const z = t => (t - DATA.min) * exag;       // kälteste Temperatur = Boden
-  const pts = idx.map(j => ({ station: DATA.stations[j], t: temps[j] }));
-  const byStation = new Map(idx.map((j, k) => [j, pts[k]]));
-  const tris = triIdx.map(v => {
-    const p = v.map(j => byStation.get(j));
-    return { v: p, mean: (p[0].t + p[1].t + p[2].t) / 3 };
+  const pts = idx.map(j => {
+    const st = DATA.stations[j], v = values[j];
+    return { station: st, v, pos: [st.lon, st.lat, VAR.height(v, DATA) * exag] };
   });
-  for (const p of pts) p.pos = [p.station.lon, p.station.lat, z(p.t)];
+  const byStation = new Map(idx.map((j, k) => [j, pts[k]]));
+  const tris = triIdx.map(t => {
+    const p = t.map(j => byStation.get(j));
+    return { v: p, mean: (p[0].v + p[1].v + p[2].v) / 3 };
+  });
   const pos = p => p.pos;
 
   const layers = [
@@ -173,36 +243,87 @@ function render() {
       getSourcePosition: p => [p.station.lon, p.station.lat, 0], getTargetPosition: pos,
       getColor: [180, 190, 205, 70], getWidth: 1
     }),
-    new deck.ScatterplotLayer({
+    // Stationen als beleuchtete 3D-Kugeln
+    new deck.SimpleMeshLayer({
       id: 'stations', data: pts, pickable: true,
-      getPosition: pos, getFillColor: p => rgb(p.t),
-      getLineColor: [15, 17, 22], lineWidthMinPixels: 1, stroked: true,
-      radiusUnits: 'pixels', getRadius: 3.5
+      mesh: SPHERE,
+      getPosition: pos, getColor: p => rgb(p.v),
+      sizeScale: metersPerPixel() * BALL_RADIUS_PX,
+      material: { ambient: 0.45, diffuse: 0.65, shininess: 40, specularColor: [90, 90, 90] }
     })
   ].filter(Boolean);
   overlay.setProps({ layers });
 
   // Beschriftung + Kennzahlen (Zeit ebenfalls interpoliert, auf Minuten)
-  const ms = Date.parse(DATA.times[i0]) + f * (Date.parse(DATA.times[i1]) - Date.parse(DATA.times[i0]));
+  const ms = DATA.startMs + (i0 + f) * HOUR;
   const d = new Date(Math.round(ms / 60000) * 60000);
   $('time').textContent = d.toLocaleString('de-DE', { timeZone: 'Europe/Berlin',
     weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const mean = d3.mean(pts, p => p.t);
-  const hot = d3.greatest(pts, p => p.t), cold = d3.least(pts, p => p.t);
-  $('stats').textContent = `${pts.length} Stationen · ${tris.length} Dreiecke · Ø ${mean.toFixed(1)} °C · ` +
-    `wärmste: ${hot.station.name} ${hot.t.toFixed(1)} °C · kälteste: ${cold.station.name} ${cold.t.toFixed(1)} °C`;
+  $('stats').textContent = VAR.stats(pts) + ` · ${tris.length} Dreiecke`;
   $('edgeVal').textContent = maxEdge + ' km';
 }
 
 function drawLegend() {
   const cv = $('legend'), ctx = cv.getContext('2d');
   for (let x = 0; x < cv.width; x++) {
-    ctx.fillStyle = color(DATA.min + (DATA.max - DATA.min) * x / (cv.width - 1));
+    // Pixel x -> Messwert -> Farbe (bei Niederschlag wurzelförmig verteilt)
+    ctx.fillStyle = color(VAR.valueAt(x / (cv.width - 1), DATA));
     ctx.fillRect(x, 0, 1, cv.height);
   }
-  $('lmin').textContent = DATA.min.toFixed(0) + ' °C';
-  $('lmid').textContent = ((DATA.min + DATA.max) / 2).toFixed(0) + ' °C';
-  $('lmax').textContent = DATA.max.toFixed(0) + ' °C';
+  const { ticks, note } = VAR.legend(DATA);
+  $('legendTitle').textContent = VAR.title;
+  [$('lmin').textContent, $('lmid').textContent, $('lmax').textContent] = ticks;
+  $('legendNote').textContent = note;
+  $('legendNote').hidden = !note;
+}
+
+// ---------- Daten laden ----------
+const MISSING = -32768;   // Platzhalter für fehlende Werte in den Int16-Reihen
+
+async function loadVar(name) {
+  if (loaded[name]) return loaded[name];
+  const r = await fetch(VARS[name].file);
+  if (!r.ok) throw new Error(VARS[name].file + ': ' + r.status);
+  const json = await r.json();
+  // Werte in kompakte Int16-Arrays umwandeln (spart viel Speicher bei 8760 Stunden)
+  json.rows = json.values.map(row => Int16Array.from(row, v => v === null ? MISSING : v));
+  delete json.values;
+  json.startMs = Date.parse(json.start);
+  return (loaded[name] = json);
+}
+
+async function switchVar(name) {
+  const buttons = document.querySelectorAll('.switch button');
+  buttons.forEach(b => b.disabled = true);
+  $('loading').textContent = 'Lade ' + VARS[name].title + ' …';
+  $('loading').hidden = false;
+  try {
+    // aktuelle Uhrzeit merken, damit nach dem Wechsel derselbe Zeitpunkt zu sehen ist
+    const currentMs = DATA ? DATA.startMs + tPos * HOUR : null;
+    const data = await loadVar(name);
+    if (VAR) exagValue[DATA.param] = $('exag').value;
+
+    VAR = VARS[name];
+    DATA = data;
+    color = VAR.makeColor(DATA);
+    Object.assign($('exag'), VAR.exag);
+    $('exag').value = exagValue[name] ?? VAR.exag.value;
+
+    $('slider').max = DATA.hours - 1;
+    tPos = currentMs === null ? DATA.hours - 1 : (currentMs - DATA.startMs) / HOUR;
+    tPos = Math.max(0, Math.min(DATA.hours - 1, tPos));
+    $('slider').value = tPos;
+
+    buttons.forEach(b => b.setAttribute('aria-pressed', b.dataset.var === name));
+    drawLegend();
+    $('loading').hidden = true;
+    render();
+  } catch (err) {
+    $('loading').textContent = 'Konnte die Daten nicht laden – läuft ein lokaler Server ' +
+      '(python3 -m http.server) und wurde fetch_dwd.py ausgeführt? (' + err.message + ')';
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
 }
 
 // ---------- Animation ----------
@@ -212,9 +333,8 @@ function tick(now) {
   const dt = lastNow ? (now - lastNow) / 1000 : 0;   // Sekunden seit letztem Frame
   lastNow = now;
   const hoursPerSecond = +$('speed').value;
-  const last = DATA.times.length - 1;
   tPos += dt * hoursPerSecond;
-  if (tPos > last) tPos = 0;                          // am Ende von vorn beginnen
+  if (tPos > DATA.hours - 1) tPos = 0;               // am Ende von vorn beginnen
   $('slider').value = tPos;
   render();
   requestAnimationFrame(tick);
@@ -228,25 +348,11 @@ $('play').onclick = () => {
 };
 $('slider').oninput = e => { tPos = +e.target.value; render(); };
 for (const id of ['exag', 'edge', 'showEdges', 'showStems']) $(id).oninput = render;
+document.querySelectorAll('.switch button').forEach(b => b.onclick = () => switchVar(b.dataset.var));
+// beim Zoomen Kugelgröße anpassen (während der Animation passiert das ohnehin)
+map.on('zoom', () => { if (!playing) render(); });
 
-// ---------- Daten laden ----------
-fetch('data/temperatures.json')
-  .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
-  .then(json => {
-    DATA = json;
-    // blau = kalt, rot = warm, Skala über den gesamten Zeitraum fixiert
-    color = d3.scaleSequential(d3.interpolateRdYlBu).domain([DATA.max, DATA.min]);
-    $('slider').max = DATA.times.length - 1;
-    tPos = DATA.times.length - 1;
-    $('slider').value = tPos;
-    drawLegend();
-    $('loading').remove();
-    render();
-  })
-  .catch(err => {
-    $('loading').textContent = 'Konnte data/temperatures.json nicht laden – läuft ein lokaler Server ' +
-      '(python3 -m http.server) und wurde fetch_dwd.py ausgeführt? (' + err.message + ')';
-  });
+switchVar('temperature');
 </script>
 </body>
 </html>
